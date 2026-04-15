@@ -26,6 +26,7 @@ from validation.hardware_test import (
     parse_sample_line,
     baseline_label as hil_baseline_label,
     intervention_recommendations as hil_intervention_recommendations,
+    normalize_serial_port,
     open_serial as hil_open_serial,
 )
 
@@ -108,6 +109,7 @@ def manual_recommendations(features):
 
 def read_hil_batch(port, baud, timeout, max_samples, room_size, start_hour):
     """Read a batch of live testbed samples and evaluate them with the shared model."""
+    port = normalize_serial_port(port)
     serial_conn = hil_open_serial(port, baud, timeout=timeout)
     records = []
 
@@ -487,12 +489,13 @@ with main_tab1:
 with main_tab2:
     st.header("🔌 Live HIL / Testbed")
     st.caption("Connect your serial testbed here to stream live sensor values and evaluate them with the same model used in simulation.")
+    st.info("Windows Arduino default supported: COM7 at 9700 baud. If you typed COMP7 by mistake, it will be normalized to COM7.")
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        hil_port = st.text_input("Serial Port", value="/dev/ttyUSB0")
+        hil_port = st.text_input("Serial Port", value="COM7")
     with c2:
-        hil_baud = st.number_input("Baud Rate", min_value=9600, max_value=921600, value=115200, step=9600)
+        hil_baud = st.number_input("Baud Rate", min_value=9600, max_value=921600, value=9700, step=100)
     with c3:
         hil_timeout = st.number_input("Timeout (s)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
 

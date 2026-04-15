@@ -6,6 +6,10 @@ Supports two modes:
 1) Serial mode: read live sensor packets from MCU/edge device.
 2) Mock mode: generate synthetic sensor stream for end-to-end verification.
 
+Windows setup notes:
+- Serial port example: COM7
+- Baud rate example: 9700
+
 Packet input formats accepted from serial line (one sample per line):
 - JSON: {"temperature":22.4,"humidity":48,"co2":650,"light":420,"occupancy_count":28}
 - CSV:  22.4,48,650,420,28
@@ -38,6 +42,16 @@ from simulation.ml_integration import predict_environment  # noqa: E402
 
 
 REQUIRED_FEATURES = ("temperature", "humidity", "co2", "light")
+
+
+def normalize_serial_port(port: str) -> str:
+	"""Normalize common Windows COM-port typos and preserve non-Windows ports."""
+	port = port.strip()
+	upper_port = port.upper()
+	if upper_port.startswith("COMP") and len(port) > 4:
+		# Accept accidental 'COMP7' and normalize to 'COM7'.
+		return f"COM{port[4:]}"
+	return port
 
 
 @dataclass
@@ -191,6 +205,7 @@ def open_serial(port: str, baudrate: int, timeout: float):
 	except ImportError as exc:
 		raise RuntimeError("pyserial is required for serial mode. Install with: pip install pyserial") from exc
 
+	port = normalize_serial_port(port)
 	return serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
 
 
@@ -346,8 +361,8 @@ def run_hil_test(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Hardware-in-the-loop model verification")
 	parser.add_argument("--mock", action="store_true", help="Use synthetic sensor stream instead of serial hardware")
-	parser.add_argument("--port", type=str, default="", help="Serial port, e.g. /dev/ttyUSB0")
-	parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate")
+	parser.add_argument("--port", type=str, default="COM7", help="Serial port, e.g. COM7 on Windows or /dev/ttyUSB0 on Linux")
+	parser.add_argument("--baud", type=int, default=9700, help="Serial baud rate (use the same value as the Arduino sketch)")
 	parser.add_argument("--timeout", type=float, default=1.0, help="Serial read timeout in seconds")
 	parser.add_argument("--duration", type=int, default=180, help="Run duration in seconds")
 	parser.add_argument("--interval", type=float, default=1.0, help="Sampling interval in seconds")
