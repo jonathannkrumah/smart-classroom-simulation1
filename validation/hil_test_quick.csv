@@ -1,0 +1,4 @@
+timestamp,temperature,humidity,co2,light,occupancy_count,model_prediction,confidence,baseline_prediction,agrees_with_baseline,recommendations
+2026-04-14T22:33:49.353585,22.335,44.3,464.005,342.499,23,non-conducive,1.0,conducive,False,
+2026-04-14T22:33:51.038233,22.424,54.706,538.91,398.138,20,non-conducive,1.0,conducive,False,
+2026-04-14T22:33:51.556140,21.25,46.792,726.323,437.149,33,non-conducive,1.0,conducive,False,
