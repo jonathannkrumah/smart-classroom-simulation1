@@ -1,19 +1,7 @@
 #!/usr/bin/env python3
 """
 Hardware-in-the-loop validation for smart classroom model.
-
-Supports two modes:
-1) Serial mode: read live sensor packets from MCU/edge device.
-2) Mock mode: generate synthetic sensor stream for end-to-end verification.
-
-Windows setup notes:
-- Serial port example: COM7
-- Baud rate example: 9700
-
-Packet input formats accepted from serial line (one sample per line):
-- JSON: {"temperature":22.4,"humidity":48,"co2":650,"light":420,"occupancy_count":28}
-- CSV:  22.4,48,650,420,28
-- Key-value: temperature=22.4,humidity=48,co2=650,light=420,occupancy_count=28
+Now aligned with simulation three-zone + ML fusion framework.
 """
 
 from __future__ import annotations
@@ -30,360 +18,319 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional
 
-
-# Ensure root import works when run as: python validation/hardware_test.py
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
-	sys.path.insert(0, str(ROOT_DIR))
+    sys.path.insert(0, str(ROOT_DIR))
 
 from simulation.ml_integration import predict_environment  # noqa: E402
 
+# Import SAME logic from simulation (critical for consistency)
+from simulation.classroom_sim import (
+    evaluate_features_zone,
+    fuse_model_zone_status,
+    compute_agreement_score,
+)
 
 REQUIRED_FEATURES = ("temperature", "humidity", "co2", "light")
 
 
 def normalize_serial_port(port: str) -> str:
-	"""Normalize common Windows COM-port typos and preserve non-Windows ports."""
-	port = port.strip()
-	upper_port = port.upper()
-	if upper_port.startswith("COMP") and len(port) > 4:
-		# Accept accidental 'COMP7' and normalize to 'COM7'.
-		return f"COM{port[4:]}"
-	return port
+    port = str(port).strip()
+    if not port:
+        return "COM7"
+    # Normalize common typo like COMP7 -> COM7.
+    return port.upper().replace("COMP", "COM")
 
 
+def apply_refined_calibration(features: Dict[str, float]) -> Dict[str, float]:
+    """Apply the same refined calibration used in the dashboard HIL pipeline."""
+    calibrated = dict(features)
+    calibrated["temperature"] = float(features["temperature"]) - 1.0
+    calibrated["humidity"] = float(features["humidity"]) * 0.6
+    calibrated["co2"] = float(features["co2"]) - 120.0
+    calibrated_light = float(features["light"]) * 0.8
+    calibrated["light"] = max(300.0, min(650.0, calibrated_light))
+    return calibrated
+
+
+# -----------------------------
+# DATA STRUCTURE
+# -----------------------------
 @dataclass
 class SensorSample:
-	timestamp: datetime
-	temperature: float
-	humidity: float
-	co2: float
-	light: float
-	occupancy_count: int = 30
+    timestamp: datetime
+    temperature: float
+    humidity: float
+    co2: float
+    light: float
+    occupancy_count: int = 30
 
-	def as_features(self) -> Dict[str, float]:
-		return {
-			"temperature": self.temperature,
-			"humidity": self.humidity,
-			"co2": self.co2,
-			"light": self.light,
-			"occupancy_count": self.occupancy_count,
-			"occupancy": self.occupancy_count,
-		}
-
-
-def baseline_label(features: Dict[str, float]) -> str:
-	"""Simple threshold baseline for verification agreement checks."""
-	conducive = True
-
-	if features["co2"] > 800:
-		conducive = False
-	if features["temperature"] > 27 or features["temperature"] < 18:
-		conducive = False
-	if features["light"] < 250 or features["light"] > 800:
-		conducive = False
-	if features["humidity"] < 30 or features["humidity"] > 70:
-		conducive = False
-
-	return "conducive" if conducive else "non-conducive"
+    def as_features(self) -> Dict[str, float]:
+        return {
+            "temperature": self.temperature,
+            "humidity": self.humidity,
+            "co2": self.co2,
+            "light": self.light,
+            "occupancy_count": self.occupancy_count,
+        }
 
 
-def intervention_recommendations(features: Dict[str, float]) -> List[str]:
-	recommendations: List[str] = []
-	if features["co2"] > 800:
-		recommendations.append("VENT_ON")
-	if features["temperature"] > 27:
-		recommendations.append("COOLING_ON")
-	elif features["temperature"] < 18:
-		recommendations.append("HEATING_ON")
-	if features["light"] < 250:
-		recommendations.append("LIGHTS_ON")
-	elif features["light"] > 800:
-		recommendations.append("DIM_LIGHTS")
-	return recommendations
-
-
-def _safe_float(value: object, default: float = math.nan) -> float:
-	try:
-		return float(value)
-	except (TypeError, ValueError):
-		return default
-
-
-def _safe_int(value: object, default: int = 30) -> int:
-	try:
-		return int(float(value))
-	except (TypeError, ValueError):
-		return default
-
-
+# -----------------------------
+# SERIAL / MOCK PARSING
+# -----------------------------
 def parse_sample_line(line: str) -> Optional[SensorSample]:
-	line = line.strip()
-	if not line:
-		return None
+    line = line.strip()
+    if not line:
+        return None
 
-	payload: Dict[str, object]
+    payload: Dict[str, object]
 
-	# JSON payload
-	if line.startswith("{") and line.endswith("}"):
-		try:
-			payload = json.loads(line)
-		except json.JSONDecodeError:
-			return None
-	else:
-		# key=value pairs
-		if "=" in line:
-			payload = {}
-			for token in line.split(","):
-				if "=" not in token:
-					continue
-				key, value = token.split("=", 1)
-				payload[key.strip()] = value.strip()
-		else:
-			# CSV fallback: temp,humidity,co2,light,occupancy(optional)
-			tokens = [t.strip() for t in line.split(",")]
-			if len(tokens) < 5:
-				if len(tokens) < 4:
-					return None
-			payload = {
-				"temperature": tokens[0],
-				"humidity": tokens[1],
-				"co2": tokens[2],
-				"light": tokens[3],
-			}
-			if len(tokens) >= 5:
-				payload["occupancy_count"] = tokens[4]
+    if line.startswith("{"):
+        payload = json.loads(line)
+    elif "=" in line:
+        payload = {}
+        for item in line.split(","):
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            payload[key.strip()] = value.strip()
+    else:
+        tokens = line.split(",")
+        if len(tokens) < 4:
+            return None
+        payload = {
+            "temperature": tokens[0],
+            "humidity": tokens[1],
+            "co2": tokens[2],
+            "light": tokens[3],
+        }
+        if len(tokens) > 4:
+            payload["occupancy_count"] = tokens[4]
 
-	temperature = _safe_float(payload.get("temperature"))
-	humidity = _safe_float(payload.get("humidity"))
-	co2 = _safe_float(payload.get("co2"))
-	light = _safe_float(payload.get("light"))
-	occupancy_count = _safe_int(payload.get("occupancy_count", payload.get("occupancy", 30)), 30)
-
-	if any(math.isnan(v) for v in (temperature, humidity, co2, light)):
-		return None
-
-	return SensorSample(
-		timestamp=datetime.now(),
-		temperature=temperature,
-		humidity=humidity,
-		co2=co2,
-		light=light,
-		occupancy_count=occupancy_count,
-	)
+    try:
+        return SensorSample(
+            timestamp=datetime.now(),
+            temperature=float(payload["temperature"]),
+            humidity=float(payload["humidity"]),
+            co2=float(payload["co2"]),
+            light=float(payload["light"]),
+            occupancy_count=int(payload.get("occupancy_count", 30)),
+        )
+    except Exception:
+        return None
 
 
-def generate_mock_stream(duration_seconds: int, interval_seconds: float, seed: int) -> Iterable[SensorSample]:
-	random.seed(seed)
-	samples = max(1, int(duration_seconds / max(interval_seconds, 0.1)))
+# -----------------------------
+# MOCK STREAM (SIMULATION-LIKE)
+# -----------------------------
+def generate_mock_stream(duration: int, interval: float):
+    steps = int(duration / interval)
 
-	for i in range(samples):
-		drift = i / max(samples, 1)
-		temp = 22 + random.uniform(-1.2, 1.2) + 4.5 * max(0, drift - 0.45)
-		humidity = 50 + random.uniform(-6, 6)
-		co2 = 500 + (420 * drift) + random.uniform(-80, 80)
-		light = 420 + random.uniform(-140, 140)
-		occupancy = random.randint(20, 35)
+    for i in range(steps):
+        drift = i / steps
 
-		yield SensorSample(
-			timestamp=datetime.now(),
-			temperature=max(14, min(35, temp)),
-			humidity=max(20, min(85, humidity)),
-			co2=max(350, min(2200, co2)),
-			light=max(80, min(1200, light)),
-			occupancy_count=occupancy,
-		)
+        yield SensorSample(
+            timestamp=datetime.now(),
+            temperature=22 + random.uniform(-1, 1) + drift * 3,
+            humidity=50 + random.uniform(-5, 5),
+            co2=500 + drift * 400 + random.uniform(-50, 50),
+            light=450 + random.uniform(-100, 100),
+            occupancy_count=random.randint(20, 35),
+        )
 
-		time.sleep(interval_seconds)
+        time.sleep(interval)
 
 
+# -----------------------------
+# SERIAL CONNECTION
+# -----------------------------
 def open_serial(port: str, baudrate: int, timeout: float):
-	try:
-		import serial  # type: ignore
-	except ImportError as exc:
-		raise RuntimeError("pyserial is required for serial mode. Install with: pip install pyserial") from exc
+    try:
+        import serial
+    except ImportError:
+        raise RuntimeError("Install pyserial: pip install pyserial")
 
-	port = normalize_serial_port(port)
-	return serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
-
-
-def summarize(records: List[Dict[str, object]]) -> None:
-	if not records:
-		print("No records collected.")
-		return
-
-	total = len(records)
-	agreements = sum(1 for r in records if r["agrees_with_baseline"])
-	conducive = sum(1 for r in records if r["model_prediction"] == "conducive")
-	non_conducive = total - conducive
-	avg_conf = statistics.fmean(float(r["confidence"]) for r in records)
-
-	print("\n" + "=" * 68)
-	print("HARDWARE-IN-THE-LOOP VERIFICATION SUMMARY")
-	print("=" * 68)
-	print(f"Samples                     : {total}")
-	print(f"Model conducive count       : {conducive}")
-	print(f"Model non-conducive count   : {non_conducive}")
-	print(f"Agreement vs baseline rules : {agreements}/{total} ({agreements / total:.1%})")
-	print(f"Average confidence          : {avg_conf:.1%}")
+    return serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
 
 
-def export_csv(records: List[Dict[str, object]], output_path: str) -> None:
-	if not records:
-		return
-
-	fieldnames = [
-		"timestamp",
-		"temperature",
-		"humidity",
-		"co2",
-		"light",
-		"occupancy_count",
-		"model_prediction",
-		"confidence",
-		"baseline_prediction",
-		"agrees_with_baseline",
-		"recommendations",
-	]
-
-	os.makedirs(os.path.dirname(output_path), exist_ok=True)
-	with open(output_path, "w", newline="", encoding="utf-8") as f:
-		writer = csv.DictWriter(f, fieldnames=fieldnames)
-		writer.writeheader()
-		writer.writerows(records)
-
-	print(f"\nSaved verification log to: {output_path}")
-
-
+# -----------------------------
+# MAIN LOOP
+# -----------------------------
 def run_hil_test(args: argparse.Namespace) -> int:
-	records: List[Dict[str, object]] = []
+    records = []
 
-	if args.mock:
-		stream = generate_mock_stream(
-			duration_seconds=args.duration,
-			interval_seconds=args.interval,
-			seed=args.seed,
-		)
-		serial_conn = None
-		print("Running in MOCK mode (no hardware serial required).")
-	else:
-		if not args.port:
-			print("Error: --port is required in serial mode.")
-			return 2
-		serial_conn = open_serial(args.port, args.baud, timeout=args.timeout)
-		stream = None
-		print(f"Connected to serial device at {args.port} @ {args.baud} baud")
+    stream = generate_mock_stream(args.duration, args.interval) if args.mock else None
+    serial_conn = None
+    empty_reads = 0
+    malformed_reads = 0
+    max_empty_reads = max(20, int(args.duration / max(args.interval, 0.2)) * 3)
 
-	started = time.time()
-	max_runtime = args.duration
+    if not args.mock:
+        port = normalize_serial_port(args.port)
+        serial_conn = open_serial(port, args.baud, args.timeout)
+        print(f"Connected to serial device at {port} @ {args.baud} baud")
 
-	try:
-		while (time.time() - started) < max_runtime:
-			if args.mock:
-				try:
-					sample = next(stream)  # type: ignore[arg-type]
-				except StopIteration:
-					break
-			else:
-				raw = serial_conn.readline().decode("utf-8", errors="ignore").strip()
-				if not raw:
-					continue
-				sample = parse_sample_line(raw)
-				if sample is None:
-					print(f"Skipping malformed line: {raw}")
-					continue
+    start = time.time()
 
-			features = sample.as_features()
-			prediction, confidence = predict_environment(
-				features,
-				context={
-					"datetime": sample.timestamp,
-					"current_minute": int(time.time() - started) // 60,
-					"room_size": args.room_size,
-					"start_hour": args.start_hour,
-				},
-			)
+    try:
+        while time.time() - start < args.duration:
 
-			baseline = baseline_label(features)
-			agrees = prediction == baseline
-			recs = intervention_recommendations(features)
+            if args.mock:
+                sample = next(stream)
+            else:
+                raw = serial_conn.readline().decode(errors="ignore")
+                if not raw.strip():
+                    # Request-response fallback for Arduino firmware that waits for a ping.
+                    serial_conn.write((datetime.now().isoformat() + "\n").encode("utf-8"))
+                    raw = serial_conn.readline().decode(errors="ignore")
+                sample = parse_sample_line(raw)
+                if not sample:
+                    if raw.strip():
+                        malformed_reads += 1
+                        if malformed_reads <= 5 or malformed_reads % 20 == 0:
+                            print(f"Skipping malformed line: {raw.strip()}")
+                    else:
+                        empty_reads += 1
+                        if empty_reads in (10, 30, 60):
+                            print(
+                                f"No serial data yet from {normalize_serial_port(args.port)}. "
+                                "Check COM port and baud (common values: 9600 or 9700)."
+                            )
+                        if empty_reads >= max_empty_reads:
+                            print("Stopping early due to repeated empty reads from serial device.")
+                            break
+                    continue
+                empty_reads = 0
 
-			ts = sample.timestamp.strftime("%H:%M:%S")
-			status = "✅" if prediction == "conducive" else "⚠️"
-			agree_text = "match" if agrees else "diff"
-			print(
-				f"[{ts}] {status} model={prediction:<13} conf={confidence:.1%} "
-				f"baseline={baseline:<13} ({agree_text}) | "
-				f"T={sample.temperature:.1f}°C CO2={sample.co2:.0f}ppm "
-				f"H={sample.humidity:.0f}% L={sample.light:.0f}lux"
-			)
+            raw_features = sample.as_features()
+            features = apply_refined_calibration(raw_features) if not args.no_calibration else raw_features
 
-			if args.send_actuation and recs and serial_conn is not None:
-				for command in recs:
-					serial_conn.write((command + "\n").encode("utf-8"))
+            # -----------------------------
+            # ML prediction
+            # -----------------------------
+            prediction, confidence = predict_environment(features)
 
-			records.append(
-				{
-					"timestamp": sample.timestamp.isoformat(),
-					"temperature": round(sample.temperature, 3),
-					"humidity": round(sample.humidity, 3),
-					"co2": round(sample.co2, 3),
-					"light": round(sample.light, 3),
-					"occupancy_count": sample.occupancy_count,
-					"model_prediction": prediction,
-					"confidence": round(float(confidence), 6),
-					"baseline_prediction": baseline,
-					"agrees_with_baseline": agrees,
-					"recommendations": ";".join(recs),
-				}
-			)
+            # -----------------------------
+            # UNIFIED SIMULATION LOGIC
+            # -----------------------------
+            zone_state = evaluate_features_zone(features)
+            fused = fuse_model_zone_status(prediction, zone_state, confidence)
 
-			if not args.mock:
-				time.sleep(max(args.interval, 0.05))
+            final_status = fused["final_status"]
+            agreement = compute_agreement_score(prediction, zone_state)
 
-	except KeyboardInterrupt:
-		print("\nStopped by user.")
-	finally:
-		if serial_conn is not None:
-			serial_conn.close()
+            # -----------------------------
+            # INTERVENTION RULES (simple hardware-side trigger)
+            # -----------------------------
+            interventions = []
+            if zone_state["overall_zone"] == "non-conducive":
+                interventions.append("CRITICAL_ADJUSTMENT")
 
-	summarize(records)
+            # -----------------------------
+            # LOGGING
+            # -----------------------------
+            records.append({
+                "time": sample.timestamp.isoformat(),
+                "temp_raw": sample.temperature,
+                "humidity_raw": sample.humidity,
+                "co2_raw": sample.co2,
+                "light_raw": sample.light,
+                "temp": features["temperature"],
+                "humidity": features["humidity"],
+                "co2": features["co2"],
+                "light": features["light"],
+                "prediction": prediction,
+                "confidence": float(confidence),
+                "final_status": final_status,
+                "zone": zone_state["overall_zone"],
+                "agreement": agreement,
+                "interventions": ";".join(interventions),
+                "calibration_mode": "raw" if args.no_calibration else "refined",
+            })
 
-	output_file = args.output
-	if output_file:
-		export_csv(records, output_file)
+            if args.no_calibration:
+                sensor_summary = (
+                    f"T={features['temperature']:.1f}C "
+                    f"H={features['humidity']:.1f}% "
+                    f"CO2={features['co2']:.0f}ppm "
+                    f"L={features['light']:.0f}lux"
+                )
+            else:
+                sensor_summary = (
+                    f"T={features['temperature']:.1f}C(raw {sample.temperature:.1f}) "
+                    f"H={features['humidity']:.1f}%(raw {sample.humidity:.1f}) "
+                    f"CO2={features['co2']:.0f}ppm(raw {sample.co2:.0f}) "
+                    f"L={features['light']:.0f}lux(raw {sample.light:.0f})"
+                )
 
-	return 0
+            print(
+                f"[{sample.timestamp.strftime('%H:%M:%S')}] "
+                f"{sensor_summary} "
+                f"model={prediction:<12} zone={zone_state['overall_zone']:<15} "
+                f"final={final_status:<15} conf={confidence:.2f}"
+            )
+
+            if not args.mock:
+                time.sleep(args.interval)
+
+    except KeyboardInterrupt:
+        print("Stopped.")
+
+    finally:
+        if serial_conn:
+            serial_conn.close()
+
+    # -----------------------------
+    # SUMMARY
+    # -----------------------------
+    print("\n=== HIL SUMMARY ===")
+    print(f"Samples: {len(records)}")
+    if records:
+        avg_conf = statistics.fmean(r["confidence"] for r in records)
+        print(f"Avg confidence: {avg_conf:.2f}")
+    else:
+        print("Avg confidence: N/A (no valid samples)")
+        if not args.mock:
+            print(
+                "Hint: verify COM port/baud and sensor payload format. "
+                "For many Arduino sketches, try --baud 9600."
+            )
+
+    if args.output and records:
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=records[0].keys())
+            writer.writeheader()
+            writer.writerows(records)
+        print(f"Saved log to: {args.output}")
+    elif args.output:
+        print("No output CSV written because no valid samples were captured.")
+
+    return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-	parser = argparse.ArgumentParser(description="Hardware-in-the-loop model verification")
-	parser.add_argument("--mock", action="store_true", help="Use synthetic sensor stream instead of serial hardware")
-	parser.add_argument("--port", type=str, default="COM7", help="Serial port, e.g. COM7 on Windows or /dev/ttyUSB0 on Linux")
-	parser.add_argument("--baud", type=int, default=9700, help="Serial baud rate (use the same value as the Arduino sketch)")
-	parser.add_argument("--timeout", type=float, default=1.0, help="Serial read timeout in seconds")
-	parser.add_argument("--duration", type=int, default=180, help="Run duration in seconds")
-	parser.add_argument("--interval", type=float, default=1.0, help="Sampling interval in seconds")
-	parser.add_argument("--room-size", type=int, default=100, help="Room size in m² for model context")
-	parser.add_argument("--start-hour", type=int, default=datetime.now().hour, help="Start hour context for model")
-	parser.add_argument("--send-actuation", action="store_true", help="Send actuator command strings to serial device")
-	parser.add_argument("--seed", type=int, default=42, help="Random seed for mock mode")
-	parser.add_argument(
-		"--output",
-		type=str,
-		default=str(ROOT_DIR / "validation" / "hil_verification_log.csv"),
-		help="CSV output path",
-	)
-	return parser
+# -----------------------------
+# CLI
+# -----------------------------
+def build_parser():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mock", action="store_true")
+    p.add_argument("--port", default="COM7")
+    p.add_argument("--baud", type=int, default=9700)
+    p.add_argument("--duration", type=int, default=120)
+    p.add_argument("--interval", type=float, default=1.0)
+    p.add_argument("--timeout", type=float, default=1.0)
+    p.add_argument("--output", default=str(ROOT_DIR / "hil_log.csv"))
+    p.add_argument("--no-calibration", action="store_true", help="Use raw sensor values instead of refined calibrated values")
+    return p
 
 
-def main() -> int:
-	parser = build_parser()
-	args = parser.parse_args()
-	return run_hil_test(args)
+def main():
+    args = build_parser().parse_args()
+    return run_hil_test(args)
 
 
 if __name__ == "__main__":
-	raise SystemExit(main())
+    raise SystemExit(main())

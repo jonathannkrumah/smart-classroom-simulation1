@@ -4,7 +4,6 @@ Core SimPy simulation for smart classroom environment
 
 import simpy
 import numpy as np
-from datetime import datetime
 from simulation.ml_integration import predict_environment
 
 
@@ -27,9 +26,11 @@ DEFAULT_SIM_CONFIG = {
     'occupancy_update_minutes': 1,
     'environment_update_minutes': 5,
     'monitor_interval_minutes': 10,
+    'attention_persistence_cycles': 2,
+    'attention_confidence_threshold': 0.7,
+    'actuator_cooldown_minutes': 15,
 }
 
-# Three-zone thresholds (attention-first policy)
 ATTENTION_THRESHOLDS = {
     'temperature': {'low': 21.0, 'high': 25.0},
     'humidity': {'low': 40.0, 'high': 60.0},
@@ -46,13 +47,13 @@ COMFORT_THRESHOLDS = {
 
 
 def evaluate_features_zone(features):
-    """Classify each factor and overall environment into optimal/acceptable/non-conducive zones."""
     factor_zones = {}
     acceptable_factors = []
     non_conducive_factors = []
 
     for factor in ('temperature', 'humidity', 'co2', 'light'):
         value = float(features[factor])
+
         att = ATTENTION_THRESHOLDS[factor]
         comfort = COMFORT_THRESHOLDS[factor]
 
@@ -61,12 +62,9 @@ def evaluate_features_zone(features):
         comfort_low = comfort.get('low', -np.inf)
         comfort_high = comfort.get('high', np.inf)
 
-        in_attention = att_low <= value <= att_high
-        in_comfort = comfort_low <= value <= comfort_high
-
-        if in_attention:
+        if att_low <= value <= att_high:
             zone = 'optimal'
-        elif in_comfort:
+        elif comfort_low <= value <= comfort_high:
             zone = 'acceptable'
         else:
             zone = 'non-conducive'
@@ -74,32 +72,10 @@ def evaluate_features_zone(features):
         factor_zones[factor] = zone
 
         if zone == 'acceptable':
-            if factor == 'co2':
-                acceptable_factors.append(
-                    f"CO₂ above attention target ({value:.0f}ppm > {att_high:.0f}ppm)"
-                )
-            elif value < att_low:
-                acceptable_factors.append(
-                    f"{factor.capitalize()} below attention range ({value:.1f} < {att_low:.1f})"
-                )
-            else:
-                acceptable_factors.append(
-                    f"{factor.capitalize()} above attention range ({value:.1f} > {att_high:.1f})"
-                )
+            acceptable_factors.append(f"{factor} outside attention band")
 
         if zone == 'non-conducive':
-            if factor == 'co2':
-                non_conducive_factors.append(
-                    f"CO₂ above comfort limit ({value:.0f}ppm > {comfort_high:.0f}ppm)"
-                )
-            elif value < comfort_low:
-                non_conducive_factors.append(
-                    f"{factor.capitalize()} below comfort limit ({value:.1f} < {comfort_low:.1f})"
-                )
-            else:
-                non_conducive_factors.append(
-                    f"{factor.capitalize()} above comfort limit ({value:.1f} > {comfort_high:.1f})"
-                )
+            non_conducive_factors.append(f"{factor} outside comfort band")
 
     if non_conducive_factors:
         overall_zone = 'non-conducive'
@@ -117,62 +93,56 @@ def evaluate_features_zone(features):
 
 
 def fuse_model_zone_status(model_prediction, zone_state, confidence, low_confidence=0.6):
-    """
-    Unified final decision policy.
-
-    Returns dict with:
-      - final_status: conducive / acceptable / non-conducive
-      - disagreement: True when model and zone imply different risk levels
-      - rationale: concise reason string
-    """
     overall_zone = zone_state.get('overall_zone', 'optimal')
     model_non_conducive = str(model_prediction) == 'non-conducive'
 
-    # Hard safety gate from threshold policy
     if overall_zone == 'non-conducive':
         return {
             'final_status': 'non-conducive',
             'disagreement': not model_non_conducive,
-            'rationale': 'Zone safety override (outside comfort limits)',
+            'rationale': 'Rule-based safety override',
         }
 
-    # Model risk signal can elevate to non-conducive
     if model_non_conducive and float(confidence) >= low_confidence:
         return {
             'final_status': 'non-conducive',
-            'disagreement': overall_zone != 'non-conducive',
-            'rationale': 'Model risk alert (high-confidence non-conducive)',
+            'disagreement': True,
+            'rationale': 'ML high-confidence risk',
         }
 
     if overall_zone == 'acceptable':
         return {
             'final_status': 'acceptable',
             'disagreement': model_non_conducive,
-            'rationale': 'Within comfort, outside attention range',
+            'rationale': 'Comfort okay, attention not optimal',
         }
 
     return {
         'final_status': 'conducive',
         'disagreement': model_non_conducive,
-        'rationale': 'Model and zone both favorable',
+        'rationale': 'All systems stable',
     }
 
+
+def compute_agreement_score(model_prediction, zone_state):
+    overall_zone = zone_state.get('overall_zone', 'optimal')
+    model_conducive = str(model_prediction) == 'conducive'
+
+    if overall_zone == 'non-conducive':
+        return 1.0 if not model_conducive else 0.0
+
+    if overall_zone == 'optimal':
+        return 1.0 if model_conducive else 0.0
+
+    return 0.5 if model_conducive else 0.0
+
+
 class ClassroomSimulation:
-    """
-    A discrete-event simulation of a classroom environment
-    using SimPy for event-based modeling
-    """
-    
-    def __init__(
-        self,
-        env,
-        num_students=30,
-        room_size=100,
-        start_hour=9,
-        initial_conditions=None,
-        sim_config=None,
-        random_seed=None,
-    ):
+
+    def __init__(self, env, num_students=30, room_size=100,
+                 start_hour=9, initial_conditions=None,
+                 sim_config=None, random_seed=None):
+
         self.env = env
         self.num_students = num_students
         self.room_size = room_size
@@ -183,325 +153,199 @@ class ClassroomSimulation:
             np.random.seed(int(random_seed))
 
         initial = initial_conditions or {}
-        
-        # Initial environmental conditions
-        self.temperature = float(initial.get('temperature', self.sim_config['temperature_baseline']))  # °C
-        self.co2 = float(initial.get('co2', self.sim_config['baseline_co2']))  # ppm
-        self.humidity = float(initial.get('humidity', 50))  # %
-        self.light = float(initial.get('light', 450 + np.random.normal(0, 50)))  # lux
+
+        self.temperature = float(initial.get('temperature', self.sim_config['temperature_baseline']))
+        self.co2 = float(initial.get('co2', self.sim_config['baseline_co2']))
+        self.humidity = float(initial.get('humidity', 50))
+        self.light = float(initial.get('light', 450))
+
         self.artificial_light_offset = 0.0
-        self.acceptable_zone_streak = 0
-        
-        # Logging
         self.log = []
-        
-        # Start simulation processes
+
+        self.attention_drift_streak = 0
+        self.acceptable_zone_streak = 0
+
+        self.last_actuation_time = {
+            'co2': -np.inf,
+            'temperature': -np.inf,
+            'humidity': -np.inf,
+            'light': -np.inf,
+        }
+
+        self.total_actuations = 0
+
         self.env.process(self.simulate_occupancy())
         self.env.process(self.simulate_environment_changes())
         self.env.process(self.monitor_and_intervene())
-    
+
     def simulate_occupancy(self):
-        """
-        Simulates the effect of student occupancy on CO2 levels
-        Based on respiration rates: ~0.005 ppm per student per minute
-        """
         while True:
-            # CO2 increases with occupancy
-            # Each student produces CO2
-            co2_production = self.num_students * self.sim_config['co2_production_per_student']  # per minute
-            
-            # Natural CO2 decay from ventilation
-            # Simple model: decay proportional to difference from baseline
-            baseline_co2 = self.sim_config['baseline_co2']
-            decay_rate = self.sim_config['co2_decay_rate']
-            co2_decay = decay_rate * (self.co2 - baseline_co2)
-            
-            # Update CO2
-            self.co2 += co2_production - co2_decay
-            
+            co2_prod = self.num_students * self.sim_config['co2_production_per_student']
+            decay = self.sim_config['co2_decay_rate'] * (self.co2 - self.sim_config['baseline_co2'])
+
+            self.co2 += co2_prod - decay
+
+            self.co2 = max(300, self.co2)
+
             yield self.env.timeout(self.sim_config['occupancy_update_minutes'])
-    
+
     def simulate_environment_changes(self):
-        """
-        Simulates changes in temperature, light, and noise
-        """
         while True:
-            # Temperature changes
-            # Heat from students and equipment
-            heat_gain = (self.num_students * self.sim_config['heat_gain_per_student']) + (
-                self.light * self.sim_config['light_heat_factor']
-            )
-            self.temperature += heat_gain * self.sim_config['temperature_heat_scale']
-            
-            # Natural cooling (simplified)
+            heat = self.num_students * self.sim_config['heat_gain_per_student']
+            self.temperature += heat * self.sim_config['temperature_heat_scale']
+
             self.temperature -= self.sim_config['temperature_cooling_coeff'] * (
                 self.temperature - self.sim_config['temperature_baseline']
             )
-            
-            # Humidity changes (simplified)
-            # Increases with occupancy, decreases with ventilation
+
             self.humidity += (self.num_students * self.sim_config['humidity_gain_per_student']) - self.sim_config['humidity_vent_loss']
-            
-            # Light - natural variation (simulating time of day)
-            hour = (self.start_hour + (self.env.now / 60)) % 24
-            if 6 <= hour <= 18:  # Daytime
-                natural_light = self.sim_config['light_day_base'] + self.sim_config['light_day_amp'] * np.sin((hour - 6) * np.pi / 12)
-            else:  # Night
+            self.humidity = np.clip(self.humidity, 0, 100)
+
+            hour = (self.start_hour + self.env.now / 60) % 24
+
+            if 6 <= hour <= 18:
+                day_progress = (hour - 6.0) / 12.0
+                # Smooth daytime curve: lower near 6/18, higher around noon.
+                daylight = np.sin(np.pi * day_progress)
+                natural_light = self.sim_config['light_day_base'] + self.sim_config['light_day_amp'] * daylight
+            else:
                 natural_light = self.sim_config['light_night_level']
 
-            # Apply persistent artificial lighting interventions
-            self.light = max(
+            self.light = np.clip(
+                natural_light + self.artificial_light_offset,
                 self.sim_config['light_min'],
-                min(self.sim_config['light_max'], natural_light + self.artificial_light_offset)
+                self.sim_config['light_max']
             )
-            
+
             yield self.env.timeout(self.sim_config['environment_update_minutes'])
-    
+
+    def evaluate_environment_zone(self, features):
+        return evaluate_features_zone(features)
+
     def monitor_and_intervene(self):
-        """
-        Uses ML model to predict learning conditions
-        and trigger simulated interventions
-        """
         while True:
-            # Current environmental state
+
             features = {
                 'temperature': self.temperature,
                 'co2': self.co2,
                 'humidity': self.humidity,
                 'light': self.light,
-                'occupancy': self.num_students,
-                'occupancy_count': self.num_students,
             }
-            
-            # Get ML model prediction
+
             try:
-                prediction, confidence = predict_environment(
-                    features,
-                    context={
-                        'current_minute': self.env.now,
-                        'start_hour': self.start_hour,
-                        'room_size': self.room_size,
-                    }
-                )
+                prediction, confidence = predict_environment(features)
+                confidence = float(confidence)
             except:
-                # Fallback if model not loaded
-                prediction = "conducive" if self.co2 < 1000 else "non-conducive"
-                confidence = 0.85
+                prediction, confidence = "conducive", 0.8
 
             zone_state = self.evaluate_environment_zone(features)
-            overall_zone = zone_state['overall_zone']
             fused = fuse_model_zone_status(prediction, zone_state, confidence)
-            final_status = fused['final_status']
-            decision_rationale = fused['rationale']
-            disagreement = fused['disagreement']
 
-            if overall_zone == 'acceptable':
+            final_status = fused['final_status']
+            agreement_score = compute_agreement_score(prediction, zone_state)
+
+            if zone_state['overall_zone'] == 'acceptable':
                 self.acceptable_zone_streak += 1
             else:
                 self.acceptable_zone_streak = 0
 
             interventions = []
-            trigger_reason = ""
-            
-            # Trigger interventions using three-zone policy
-            if overall_zone == 'non-conducive':
-                trigger_reason = "Immediate: non-conducive zone"
-                interventions = self.trigger_intervention(features)
-            elif overall_zone == 'acceptable':
-                acceptable_factor_count = len(zone_state['acceptable_factors'])
-                if self.acceptable_zone_streak >= 2:
-                    trigger_reason = "Delayed: acceptable zone persisted"
-                    interventions = self.trigger_intervention(features)
-                elif confidence < 0.6:
-                    trigger_reason = "Precaution: acceptable zone + low confidence"
-                    interventions = self.trigger_intervention(features)
-                elif acceptable_factor_count >= 2:
-                    trigger_reason = "Precaution: multiple acceptable drifts"
-                    interventions = self.trigger_intervention(features)
+            intervention_count = 0
 
-            # Log current state
-            self.log_state(
-                features,
-                prediction,
-                confidence,
-                zone_state,
-                interventions,
-                trigger_reason,
-                final_status=final_status,
-                disagreement=disagreement,
-                decision_rationale=decision_rationale,
-            )
-            
+            now = float(self.env.now)
+            cooldown = float(self.sim_config['actuator_cooldown_minutes'])
+
+            def can_actuate(factor):
+                return (now - float(self.last_actuation_time[factor])) >= cooldown
+
+            def record_actuation(factor, message):
+                nonlocal intervention_count
+                self.last_actuation_time[factor] = now
+                self.total_actuations += 1
+                intervention_count += 1
+                interventions.append(message)
+
+            # CO2 control
+            if self.co2 > ATTENTION_THRESHOLDS['co2']['high'] and can_actuate('co2'):
+                if self.co2 > COMFORT_THRESHOLDS['co2']['high']:
+                    self.co2 = max(self.sim_config['baseline_co2'], self.co2 - 180)
+                    record_actuation('co2', 'Emergency ventilation boost (CO2)')
+                else:
+                    self.co2 = max(self.sim_config['baseline_co2'], self.co2 - 90)
+                    record_actuation('co2', 'Ventilation increased (CO2)')
+
+            # Temperature control
+            t_low = ATTENTION_THRESHOLDS['temperature']['low']
+            t_high = ATTENTION_THRESHOLDS['temperature']['high']
+            if self.temperature > t_high and can_actuate('temperature'):
+                self.temperature = max(t_low, self.temperature - 0.8)
+                record_actuation('temperature', 'Cooling pulse applied')
+            elif self.temperature < t_low and can_actuate('temperature'):
+                self.temperature = min(t_high, self.temperature + 0.8)
+                record_actuation('temperature', 'Heating pulse applied')
+
+            # Humidity control
+            h_low = ATTENTION_THRESHOLDS['humidity']['low']
+            h_high = ATTENTION_THRESHOLDS['humidity']['high']
+            if self.humidity > h_high and can_actuate('humidity'):
+                self.humidity = max(h_low, self.humidity - 3.0)
+                record_actuation('humidity', 'Dehumidification cycle triggered')
+            elif self.humidity < h_low and can_actuate('humidity'):
+                self.humidity = min(h_high, self.humidity + 3.0)
+                record_actuation('humidity', 'Humidification cycle triggered')
+
+            # Lighting control via artificial lighting offset.
+            l_low = ATTENTION_THRESHOLDS['light']['low']
+            l_high = ATTENTION_THRESHOLDS['light']['high']
+            if self.light < l_low and can_actuate('light'):
+                self.artificial_light_offset += 60
+                record_actuation('light', 'Lighting increased to attention range')
+            elif self.light > l_high and can_actuate('light'):
+                self.artificial_light_offset -= 60
+                record_actuation('light', 'Lighting reduced to attention range')
+
+            self.artificial_light_offset = float(np.clip(self.artificial_light_offset, -300, 400))
+
+            zone_trigger_reason = fused['rationale']
+            if zone_state['non_conducive_factors']:
+                zone_trigger_reason = ' | '.join(zone_state['non_conducive_factors'])
+            elif zone_state['acceptable_factors']:
+                zone_trigger_reason = ' | '.join(zone_state['acceptable_factors'])
+
+            interventions_triggered = '; '.join(interventions)
+
+            model_zone_disagreement = int(bool(fused['disagreement']))
+
+            self.log.append({
+                'time': self.env.now,
+                'temp': self.temperature,
+                'co2': self.co2,
+                'humidity': self.humidity,
+                'light': self.light,
+                'prediction': prediction,
+                'model_prediction': prediction,
+                'final_status': final_status,
+                'agreement': agreement_score,
+                'agreement_score': agreement_score,
+                'zone': zone_state['overall_zone'],
+                'overall_zone': zone_state['overall_zone'],
+                'non_conducive_factors': '; '.join(zone_state['non_conducive_factors']),
+                'acceptable_factors': '; '.join(zone_state['acceptable_factors']),
+                'model_zone_disagreement': model_zone_disagreement,
+                'interventions': interventions,
+                'interventions_triggered': interventions_triggered,
+                'intervention_count': intervention_count,
+                'total_actuations': self.total_actuations,
+                'zone_trigger_reason': zone_trigger_reason,
+                'confidence': confidence,
+            })
+
             yield self.env.timeout(self.sim_config['monitor_interval_minutes'])
 
-    def evaluate_environment_zone(self, features):
-        return evaluate_features_zone(features)
-    
-    def trigger_intervention(self, features):
-        """
-        Simulates IoT actuator responses to poor conditions
-        """
-        interventions = []
-        
-        # CO2 intervention (ventilation)
-        if features['co2'] > COMFORT_THRESHOLDS['co2']['high']:
-            self.co2 -= 150
-            interventions.append(f"Ventilation HIGH (CO2: {features['co2']:.0f}ppm)")
-        elif features['co2'] > ATTENTION_THRESHOLDS['co2']['high']:
-            self.co2 -= 100
-            interventions.append(f"Ventilation LOW (CO2: {features['co2']:.0f}ppm)")
-        
-        # Temperature intervention (cooling)
-        if features['temperature'] > COMFORT_THRESHOLDS['temperature']['high']:
-            self.temperature -= 1.5
-            interventions.append(f"Cooling HIGH (Temp: {features['temperature']:.1f}°C)")
-        elif features['temperature'] > ATTENTION_THRESHOLDS['temperature']['high']:
-            self.temperature -= 0.6
-            interventions.append(f"Cooling LOW (Temp: {features['temperature']:.1f}°C)")
-        elif features['temperature'] < COMFORT_THRESHOLDS['temperature']['low']:
-            self.temperature += 1.5
-            interventions.append(f"Heating HIGH (Temp: {features['temperature']:.1f}°C)")
-        elif features['temperature'] < ATTENTION_THRESHOLDS['temperature']['low']:
-            self.temperature += 0.6
-            interventions.append(f"Heating LOW (Temp: {features['temperature']:.1f}°C)")
 
-        # Humidity intervention
-        if features['humidity'] > COMFORT_THRESHOLDS['humidity']['high']:
-            self.humidity -= 4
-            interventions.append(f"Dehumidifier ON (Humidity: {features['humidity']:.1f}%)")
-        elif features['humidity'] < ATTENTION_THRESHOLDS['humidity']['low']:
-            self.humidity += 4
-            interventions.append(f"Humidifier ON (Humidity: {features['humidity']:.1f}%)")
-        
-        # Light intervention
-        if features['light'] < ATTENTION_THRESHOLDS['light']['low']:
-            boost = 180 if features['light'] < COMFORT_THRESHOLDS['light']['low'] else 80
-            self.artificial_light_offset = min(500, self.artificial_light_offset + boost)
-            interventions.append(
-                f"Lights ON (Light: {features['light']:.0f}lux, boost: +{self.artificial_light_offset:.0f})"
-            )
-        elif features['light'] > ATTENTION_THRESHOLDS['light']['high']:
-            reduction = 120 if features['light'] > COMFORT_THRESHOLDS['light']['high'] else 60
-            self.artificial_light_offset = max(-300, self.artificial_light_offset - reduction)
-            interventions.append(
-                f"Blinds adjusted (Light: {features['light']:.0f}lux, boost: +{self.artificial_light_offset:.0f})"
-            )
-        
-        if interventions:
-            timestamp = self.env.now
-            print(f"\n[{timestamp}min] INTERVENTIONS TRIGGERED:")
-            for i in interventions:
-                print(f"  • {i}")
-
-        return interventions
-    
-    def log_state(
-        self,
-        features,
-        prediction,
-        confidence,
-        zone_state=None,
-        interventions=None,
-        trigger_reason="",
-        final_status=None,
-        disagreement=False,
-        decision_rationale="",
-    ):
-        """
-        Logs the current environmental state
-        """
-        timestamp = self.env.now
-        zone_state = zone_state or {
-            'overall_zone': 'optimal',
-            'acceptable_factors': [],
-            'non_conducive_factors': [],
-        }
-        non_conducive_factors = zone_state.get('non_conducive_factors', [])
-        acceptable_factors = zone_state.get('acceptable_factors', [])
-        interventions = interventions or []
-        log_entry = {
-            'time': timestamp,
-            'temperature': features['temperature'],
-            'co2': features['co2'],
-            'humidity': features['humidity'],
-            'light': features['light'],
-            'prediction': prediction,
-            'model_prediction': prediction,
-            'confidence': confidence,
-            'final_status': final_status or prediction,
-            'model_zone_disagreement': bool(disagreement),
-            'decision_rationale': decision_rationale,
-            'overall_zone': zone_state.get('overall_zone', 'optimal'),
-            'acceptable_factors': '; '.join(acceptable_factors),
-            'non_conducive_factors': '; '.join(non_conducive_factors),
-            'interventions_triggered': '; '.join(interventions),
-            'intervention_count': len(interventions),
-            'zone_trigger_reason': trigger_reason,
-        }
-        self.log.append(log_entry)
-        
-        # Print periodic updates (every 30 minutes)
-        if timestamp % 30 == 0:
-            final_status = final_status or prediction
-            status_icon = "✅" if final_status == "conducive" else "⚠️"
-            overall_zone = zone_state.get('overall_zone', 'optimal')
-            factor_note = f" | cause: {', '.join(non_conducive_factors)}" if non_conducive_factors else ""
-            print(f"[{timestamp:3d}min] {status_icon} Temp:{features['temperature']:5.1f}°C "
-                  f"CO2:{features['co2']:6.0f}ppm Hum:{features['humidity']:5.1f}% "
-                  f"Light:{features['light']:5.0f}lux "
-                f"| model:{prediction} final:{final_status} ({confidence:.1%}) | zone:{overall_zone}{factor_note}")
-
-def run_simulation(
-    hours=2,
-    num_students=30,
-    start_hour=9,
-    room_size=100,
-    initial_conditions=None,
-    sim_config=None,
-    random_seed=None,
-):
-    """
-    Runs the classroom simulation
-    """
-    # Create simulation environment
+def run_simulation(hours=2, num_students=30):
     env = simpy.Environment()
-    
-    # Create classroom instance
-    classroom = ClassroomSimulation(
-        env,
-        num_students=num_students,
-        room_size=room_size,
-        start_hour=start_hour,
-        initial_conditions=initial_conditions,
-        sim_config=sim_config,
-        random_seed=random_seed,
-    )
-    
-    print(f"\n🏫 SIMULATION STARTED")
-    print(f"   Duration: {hours} hours ({hours*60} minutes)")
-    print(f"   Students: {num_students}")
-    print(f"   Room size: {room_size} m²")
-    print(f"   Start hour: {start_hour:02d}:00")
-    print(f"   Initial CO2: {classroom.co2}ppm")
-    print(f"   Initial Temp: {classroom.temperature}°C")
-    print("-" * 70)
-    
-    # Run simulation
+    sim = ClassroomSimulation(env, num_students=num_students)
+
     env.run(until=hours * 60)
-    
-    print("-" * 70)
-    print(f"\n📊 SIMULATION SUMMARY")
-    print(f"   Final CO2: {classroom.co2:.0f}ppm")
-    print(f"   Final Temp: {classroom.temperature:.1f}°C")
-    print(f"   Total logs: {len(classroom.log)}")
-    
-    # Calculate statistics
-    conducive_count = sum(
-        1 for entry in classroom.log
-        if entry.get('final_status', entry.get('prediction')) == 'conducive'
-    )
-    if classroom.log:
-        conducive_percent = (conducive_count / len(classroom.log)) * 100
-        print(f"   Time conducive: {conducive_percent:.1f}%")
-    
-    return classroom.log
+    return sim.log

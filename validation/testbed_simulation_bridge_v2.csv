@@ -1,0 +1,1 @@
+timestamp,dht_temperature,lm35_temperature,humidity,co2,light,occupancy_count,model_prediction,model_confidence,baseline_prediction,overall_zone,final_status,model_zone_disagreement,decision_rationale,agreement_score,bridge_recommendations,acceptable_factors,non_conducive_factors,raw_line
