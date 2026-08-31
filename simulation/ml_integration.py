@@ -41,11 +41,11 @@ def _discover_artifacts():
     scaler_candidates = [p for p in artifact_files if 'scaler' in os.path.basename(p).lower()]
 
     if model_candidates:
-        # Prefer core_model.pkl (latest, aligned with simulation), then random_forest, else first
+        # Prefer core_model.pkl (latest, aligned with simulation), then bilstm, else first
         basename_to_priority = {
             'core_model.pkl': 0,
-            'random_forest_model.joblib': 1,
-            'random_forest.pkl': 1,
+            'bilstm_model.joblib': 1,
+            'bilstm_scaler.pkl': 1,
         }
         model_candidates.sort(key=lambda p: (
             basename_to_priority.get(os.path.basename(p), 99),
